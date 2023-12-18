@@ -6,17 +6,18 @@ import copy
 import numpy as np
 import pickle
 from tqdm import tqdm
-import random,math
+import random, math
 import time
 import pandas as pd
 from PIL import Image
 import soundfile as sf
 import cv2
 from torch.utils.data import DataLoader
+from transformers import Wav2Vec2Processor
+import librosa
 from multiprocessing import Pool
-import torchaudio
 from scipy.io import loadmat
-torchaudio.set_audio_backend("soundfile")
+
 from functools import cmp_to_key
 
 
@@ -59,44 +60,13 @@ def extract_video_features(video_path, img_transform):
     return video_clip, fps, n_frames
 
 
-def extract_audio_features(audio_path, fps, n_frames):
-    # video_id = osp.basename(audio_path)[:-4]
-    audio, sr = sf.read(audio_path)
-    if audio.ndim == 2:
-        audio = audio.mean(-1)
-    frame_n_samples = int(sr / fps)
-    curr_length = len(audio)
-    target_length = frame_n_samples * n_frames
-    if curr_length > target_length:
-        audio = audio[:target_length]
-    elif curr_length < target_length:
-        audio = np.pad(audio, [0, target_length - curr_length])
-    shifted_n_samples = 0
-    curr_feats = []
-    for i in range(n_frames):
-        curr_samples = audio[i*frame_n_samples:shifted_n_samples + i*frame_n_samples + frame_n_samples]
-        curr_mfcc = torchaudio.compliance.kaldi.mfcc(torch.from_numpy(curr_samples).float().view(1, -1), sample_frequency=sr, use_energy=True)
-        curr_mfcc = curr_mfcc.transpose(0, 1) # (freq, time)
-        curr_mfcc_d = torchaudio.functional.compute_deltas(curr_mfcc)
-        curr_mfcc_dd = torchaudio.functional.compute_deltas(curr_mfcc_d)
-        curr_mfccs = np.stack((curr_mfcc.numpy(), curr_mfcc_d.numpy(), curr_mfcc_dd.numpy())).reshape(-1)
-        curr_feat = curr_mfccs
-        # rms = librosa.feature.rms(curr_samples, sr).reshape(-1)
-        # zcr = librosa.feature.zero_crossing_rate(curr_samples, sr).reshape(-1)
-        # curr_feat = np.concatenate((curr_mfccs, rms, zcr))
-
-        curr_feats.append(curr_feat)
-
-    curr_feats = np.stack(curr_feats, axis=0)
-    return curr_feats
-
-
 class ReactionDataset(data.Dataset):
     """Custom data.Dataset compatible with data.DataLoader."""
 
     def __init__(self, root_path, split, img_size=256, crop_size=224, clip_length=751, fps=25,
                  load_audio=True, load_video_s=True, load_video_l=True, load_emotion_s=False, load_emotion_l=False,
                  load_3dmm_s=False, load_3dmm_l=False, load_ref=True,
+                 load_neighbour_matrix=False,
                  repeat_mirrored=True):
         """
         Args:
@@ -132,11 +102,18 @@ class ReactionDataset(data.Dataset):
         self.load_emotion_s = load_emotion_s
         self.load_emotion_l = load_emotion_l
         self.load_ref = load_ref
+        self.load_neighbour_matrix = load_neighbour_matrix
+
+        if self.load_neighbour_matrix:
+            self.neighbour_matrix = np.load(
+                os.path.join(self._root_path, 'neighbour_emotion_' + str(self._split) + '.npy'))
 
         self._audio_path = os.path.join(self._data_path, 'Audio_files')
         self._video_path = os.path.join(self._data_path, 'Video_files')
         self._emotion_path = os.path.join(self._data_path, 'Emotion')
         self._3dmm_path = os.path.join(self._data_path, '3D_FV_files')
+
+        self.processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
 
         self.mean_face = torch.FloatTensor(
             np.load('external/FaceVerse/mean_face.npy').astype(np.float32)).view(1, 1, -1)
@@ -181,12 +158,9 @@ class ReactionDataset(data.Dataset):
         data = self.data_list[index]
 
         # ========================= Data Augmentation ==========================
-        changed_sign = 0
-        if self._split == 'train':  # only done at training time
-            changed_sign = random.randint(0, 1)
 
-        speaker_prefix = 'speaker' if changed_sign == 0 else 'listener'
-        listener_prefix = 'listener' if changed_sign == 0 else 'speaker'
+        speaker_prefix = 'speaker'
+        listener_prefix = 'listener'
 
         # ========================= Load Speaker & Listener video clip ==========================
         speaker_video_path = data[f'{speaker_prefix}_video_path']
@@ -222,9 +196,11 @@ class ReactionDataset(data.Dataset):
         listener_audio_clip, speaker_audio_clip = 0, 0
         if self.load_audio:
             speaker_audio_path = data[f'{speaker_prefix}_audio_path']
-            speaker_audio_clip = extract_audio_features(speaker_audio_path, self._fps, total_length)
-            speaker_audio_clip = speaker_audio_clip[cp:cp + self._clip_length]
-
+            speech_array, sampling_rate = librosa.load(speaker_audio_path, sr=16000)
+            interval = sampling_rate // self._fps
+            speaker_audio_clip = torch.FloatTensor(
+                np.squeeze(self.processor(speech_array, sampling_rate=16000).input_values))
+            speaker_audio_clip = speaker_audio_clip[int(cp * interval): int((cp + self._clip_length) * interval)]
 
         # ========================= Load Speaker & Listener emotion ==========================
         listener_emotion, speaker_emotion = 0, 0
@@ -263,13 +239,74 @@ class ReactionDataset(data.Dataset):
             listener_reference = self._img_loader(os.path.join(listener_video_path, img_paths[0]))
             listener_reference = self._transform(listener_reference)
 
-        return speaker_video_clip, speaker_audio_clip, speaker_emotion, speaker_3dmm, listener_video_clip, listener_audio_clip, listener_emotion, listener_3dmm, listener_reference
+        listener_neighbour_3d = 0
+        listener_neighbour_emotion = 0
+        if self.load_neighbour_matrix:
+            # n_lines = self.neighbour_matrix.shape[0]
+            speaker_line = self.neighbour_matrix[index]
+            speaker_line_index = np.argwhere(speaker_line == 1).reshape(-1)
+            speaker_line_index_len = len(speaker_line_index)
+            speaker_line_index_len = min(speaker_line_index_len, 80)
+            listener_neighbour_3d = []
+            listener_neighbour_emotion = []
+
+            for k in range(80):
+                if k < speaker_line_index_len:
+                    speaker_neighbour_index = speaker_line_index[k]
+                    corresponding_listener_3dmm = torch.FloatTensor(
+                        np.load(self.data_list[speaker_neighbour_index]['listener_3dmm_path'])).squeeze()
+                    corresponding_listener_3dmm = corresponding_listener_3dmm[cp: cp + self._clip_length]
+                    corresponding_listener_3dmm = self._transform_3dmm(corresponding_listener_3dmm)[0]
+
+                    corresponding_listener_emotion_path = self.data_list[speaker_neighbour_index][
+                        f'{listener_prefix}_emotion_path']
+                    corresponding_listener_emotion = pd.read_csv(corresponding_listener_emotion_path, header=None,
+                                                                 delimiter=',')
+                    corresponding_listener_emotion = torch.from_numpy(
+                        np.array(corresponding_listener_emotion.drop(0)).astype(np.float32))[
+                                                     cp: cp + self._clip_length]
+
+                else:
+                    if self.load_3dmm_l:
+                        corresponding_listener_3dmm = torch.zeros_like(listener_3dmm).float() + 1e5
+                    elif self.load_3dmm_s:
+                        corresponding_listener_3dmm = torch.zeros_like(speaker_3dmm).float() + 1e5
+                    else:
+                        corresponding_listener_3dmm = torch.FloatTensor(
+                            np.load(self.data_list[0]['listener_3dmm_path'])).squeeze()
+                        corresponding_listener_3dmm = corresponding_listener_3dmm[cp: cp + self._clip_length]
+                        corresponding_listener_3dmm = self._transform_3dmm(corresponding_listener_3dmm)[0]
+                        corresponding_listener_3dmm = torch.zeros_like(corresponding_listener_3dmm).float() + 1e5
+
+                    if self.load_emotion_l:
+                        corresponding_listener_emotion = torch.zeros_like(listener_emotion).float() + 1e5
+                    elif self.load_emotion_s:
+                        corresponding_listener_emotion = torch.zeros_like(speaker_emotion).float() + 1e5
+                    else:
+
+                        corresponding_listener_emotion_path = self.data_list[0][
+                            f'{listener_prefix}_emotion_path']
+                        corresponding_listener_emotion = pd.read_csv(corresponding_listener_emotion_path, header=None,
+                                                                     delimiter=',')
+                        corresponding_listener_emotion = torch.from_numpy(
+                            np.array(corresponding_listener_emotion.drop(0)).astype(np.float32))[
+                                                         cp: cp + self._clip_length]
+                        corresponding_listener_emotion = torch.zeros_like(corresponding_listener_emotion).float() + 1e5
+
+                listener_neighbour_3d.append(corresponding_listener_3dmm.unsqueeze(0))
+                listener_neighbour_emotion.append(corresponding_listener_emotion.unsqueeze(0))
+
+            listener_neighbour_3d = torch.cat(listener_neighbour_3d, dim=0)
+            listener_neighbour_emotion = torch.cat(listener_neighbour_emotion, dim=0)
+
+        return speaker_video_clip, speaker_audio_clip, speaker_emotion, speaker_3dmm, listener_video_clip, listener_audio_clip, listener_emotion, listener_3dmm, listener_reference, listener_neighbour_3d, listener_neighbour_emotion, listener_video_path
 
     def __len__(self):
         return self._len
 
 
 def get_dataloader(conf, split, load_audio=False, load_video_s=False, load_video_l=False, load_emotion_s=False,
+                   load_neighbour_matrix=False,
                    load_emotion_l=False, load_3dmm_s=False, load_3dmm_l=False, load_ref=False, repeat_mirrored=True):
     assert split in ["train", "val", "test"], "split must be in [train, val, test]"
     # print('==> Preparing data for {}...'.format(split) + '\n')
@@ -277,6 +314,7 @@ def get_dataloader(conf, split, load_audio=False, load_video_s=False, load_video
                               clip_length=conf.clip_length,
                               load_audio=load_audio, load_video_s=load_video_s, load_video_l=load_video_l,
                               load_emotion_s=load_emotion_s, load_emotion_l=load_emotion_l, load_3dmm_s=load_3dmm_s,
+                              load_neighbour_matrix=load_neighbour_matrix,
                               load_3dmm_l=load_3dmm_l, load_ref=load_ref, repeat_mirrored=repeat_mirrored)
     shuffle = True if split == "train" else False
     dataloader = DataLoader(dataset=dataset, batch_size=conf.batch_size, shuffle=shuffle, num_workers=conf.num_workers)
