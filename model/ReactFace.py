@@ -418,7 +418,7 @@ class ReactFace(nn.Module):
                 motion_sample = self.momentum * past_motion_sample + (1 - self.momentum) * motion_sample
                 motion_sample_input = F.interpolate(
                     torch.cat((past_motion_sample.unsqueeze(-1), motion_sample.unsqueeze(-1)), dim=-1),
-                    self.window_size, mode='linear')
+                    self.window_size, mode='linear', align_corners = False)
                 motion_sample_input = motion_sample_input.transpose(1, 2)
             else:
                 motion_sample_input = motion_sample.unsqueeze(1)
