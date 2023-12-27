@@ -8,9 +8,8 @@ import argparse
 from tqdm import tqdm
 import logging
 from dataset import ReactionDataset
-from model import TransformerVAE
+from model import ReactFace
 from utils import AverageMeter
-from render import Render
 from model.losses import VAELoss
 from metric import *
 from dataset import get_dataloader
@@ -27,6 +26,8 @@ def parse_arg():
     parser.add_argument('--img-size', default=256, type=int, help="size of train/test image data")
     parser.add_argument('--crop-size', default=224, type=int, help="crop size of train/test image data")
     parser.add_argument('-seq-len', default=751, type=int, help="length of clip")
+    parser.add_argument('-max-seq-len', default=751, type=int, help="max length of clip")
+    parser.add_argument('--clip-length', default=751, type=int, help="len of video clip")
     parser.add_argument('--window-size', default=8, type=int, help="prediction window-size for online mode")
     parser.add_argument('--feature-dim', default=128, type=int, help="feature dim of model")
     parser.add_argument('--audio-dim', default=39, type=int, help="feature dim of audio")
@@ -57,24 +58,22 @@ def val(args, model, val_loader, criterion, render):
     speaker_emotion_list = []
     all_listener_emotion_list = []
 
-    for batch_idx, (speaker_video_clip, speaker_audio_clip, speaker_emotion, listener_video_clip, _, listener_emotion, listener_3dmm, listener_references) in enumerate(tqdm(val_loader)):
+    for batch_idx, (speaker_video_clip, speaker_audio_clip, speaker_emotion, _, _, _, listener_emotion, listener_3dmm, listener_references, _, _, _) in enumerate(tqdm(val_loader)):
         if torch.cuda.is_available():
             speaker_video_clip, speaker_audio_clip, listener_emotion, listener_3dmm, listener_references = \
-                speaker_video_clip[:,:750].cuda(), speaker_audio_clip[:,:750].cuda(), listener_emotion[:,:750].cuda(), listener_3dmm[:,:750].cuda(), listener_references[:,:750].cuda()
+                speaker_video_clip.cuda(), speaker_audio_clip.cuda(), listener_emotion.cuda(), listener_3dmm.cuda(), listener_references.cuda()
+                #speaker_video_clip[:,:750].cuda(), speaker_audio_clip[:,:750].cuda(), listener_emotion[:,:750].cuda(), listener_3dmm[:,:750].cuda(), listener_references[:,:750].cuda()
 
         with torch.no_grad():
             listener_3dmm_out, listener_emotion_out, distribution = model(speaker_video_clip, speaker_audio_clip)
 
-            loss, rec_loss, kld_loss = criterion(listener_emotion, listener_3dmm, listener_emotion_out, listener_3dmm_out, distribution)
+            loss, rec_loss, kld_loss = criterion[0](listener_emotion, listener_3dmm, listener_emotion_out, listener_3dmm_out, distribution)
+
 
             losses.update(loss.data.item(), speaker_video_clip.size(0))
             rec_losses.update(rec_loss.data.item(), speaker_video_clip.size(0))
             kld_losses.update(kld_loss.data.item(), speaker_video_clip.size(0))
             B = speaker_video_clip.shape[0]
-            if (batch_idx % 25) == 0:
-                for bs in range(B):
-                    render.rendering_for_fid(out_dir, "{}_b{}_ind{}".format(args.split, str(batch_idx + 1), str(bs + 1)),
-                            listener_3dmm_out[bs], speaker_video_clip[bs], listener_references[bs], listener_video_clip[bs,:750])
             listener_emotion_list.append(listener_emotion_out.cpu())
             speaker_emotion_list.append(speaker_emotion)
 
@@ -85,10 +84,11 @@ def val(args, model, val_loader, criterion, render):
     print("-----------------Repeat 9 times-----------------")
     for i in range(9):
         listener_emotion_list = []
-        for batch_idx, (speaker_video_clip, speaker_audio_clip, _, _, _, _, _, _) in enumerate(tqdm(val_loader)):
+        for batch_idx, (speaker_video_clip, speaker_audio_clip, _, _, _, _, _, _, _, _, _, _) in enumerate(tqdm(val_loader)):
             if torch.cuda.is_available():
                 speaker_video_clip, speaker_audio_clip = \
-                    speaker_video_clip[:,:750].cuda(), speaker_audio_clip[:,:750].cuda()
+                    speaker_video_clip.cuda(), speaker_audio_clip.cuda()
+                    #peaker_video_clip[:,:750].cuda(), speaker_audio_clip[:,:750].cuda()
             with torch.no_grad():
                 _, listener_emotion_outs, _ = model(speaker_video_clip, speaker_audio_clip)
                 listener_emotion_list.append(listener_emotion_outs[:,:750].cpu())
@@ -102,15 +102,15 @@ def val(args, model, val_loader, criterion, render):
     FRDvs = compute_FRDvs(all_listener_emotion)
     FRVar  = compute_FRVar(all_listener_emotion)
     smse  = compute_s_mse(all_listener_emotion)
-    TLCC = compute_TLCC(all_listener_emotion, speaker_emotion)
+    #TLCC = compute_TLCC(all_listener_emotion, speaker_emotion)
 
-    return losses.avg, rec_losses.avg, kld_losses.avg, FRC, FRD, FRDvs, FRVar, smse, TLCC
+    return losses.avg, rec_losses.avg, kld_losses.avg, FRC, FRD, FRDvs, FRVar, smse, 0
 
 
 def main(args):
-    val_loader = get_dataloader(args, args.split)
-    model = TransformerVAE(img_size = args.img_size, audio_dim = args.audio_dim, output_emotion_dim = args.emotion_dim, output_3dmm_dim = args._3dmm_dim, feature_dim = args.feature_dim, seq_len = args.seq_len, online = args.online, window_size = args.window_size, device = args.device)
-    criterion = VAELoss(args.kl_p)
+    val_loader = get_dataloader(args, "val", load_audio=True, load_video_s=True,  load_emotion_l=True, load_3dmm_l=True, load_ref=True)
+    model = ReactFace(img_size = args.img_size, output_3dmm_dim = args._3dmm_dim, output_emotion_dim = args.emotion_dim, feature_dim = args.feature_dim, max_seq_len = args.max_seq_len, window_size = args.window_size, device = args.device)
+    criterion = [VAELoss(args.kl_p).cuda()]
 
     if args.resume != '':
         checkpoint_path = args.resume
@@ -121,9 +121,8 @@ def main(args):
 
     if torch.cuda.is_available():
         model = model.cuda()
-        render = Render('cuda')
-    else:
-        render = Render()
+        
+    render = None
 
     val_loss, rec_loss, kld_loss, FRC, FRD, FRDvs, FRVar, smse, TLCC = val(args, model, val_loader, criterion, render)
     print("{}_loss: {:.5f}   {}_rec_loss: {:.5f}  {}_kld_loss: {:.5f} ".format(args.split, val_loss, args.split, rec_loss, args.split, kld_loss))
