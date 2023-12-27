@@ -1,21 +1,55 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import copy
-import math
-from .wav2vec import Wav2Vec2Model
 from .wav2vec2focctc import Wav2Vec2ForCTC
-import argparse
-import librosa
-from transformers import Wav2Vec2Processor
 from .utils import  init_biased_mask, enc_dec_mask, PeriodicPositionalEncoding
+from torch.nn.modules.transformer import _get_clones
+
+class MBT(nn.Module):
+    def __init__(self, dim, num_layers, num_heads, num_bottle_token, device):
+        super(MBT, self).__init__()
+        self.dim = dim
+        self.device = device
+        self.num_layers = num_layers
+        self.num_bottle_token = num_bottle_token
+        encoder_layer = nn.TransformerEncoderLayer(d_model=dim, nhead=num_heads)
+
+        self.x_layers = _get_clones(encoder_layer, num_layers)
+        self.y_layers = _get_clones(encoder_layer, num_layers)
+
+        self.bot = nn.Parameter(torch.randn(1, num_bottle_token, dim))
+
+    def get_mask(self, b, l):
+        return torch.zeros(b, l+self.num_bottle_token).to(device=self.device)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor):
+        mask_x = self.get_mask(x.shape[0], x.shape[1])
+        mask_y = self.get_mask(y.shape[0], y.shape[1])
+
+        bot = self.bot.expand(x.shape[0], -1, -1)
+        x = torch.cat((bot, x), dim=1)
+        y = torch.cat((bot, y), dim=1)
+
+        x = x.permute(1, 0, 2)
+        y = y.permute(1, 0, 2)
+
+        for i in range(self.num_layers):
+            x = self.x_layers[i](src=x, src_key_padding_mask=mask_x)
+            y = self.y_layers[i](src=y, src_key_padding_mask=mask_y)
+
+            x[:self.num_bottle_token] = (x[:self.num_bottle_token] + y[:self.num_bottle_token]) / 2
+            y[:self.num_bottle_token] = x[:self.num_bottle_token]
+
+        x = x[self.num_bottle_token:,:,:].permute(1, 0, 2)
+        y = y[self.num_bottle_token:,:,:].permute(1, 0, 2)
+
+        return x, y
 
 
 class SpeakFormer(nn.Module):
-    def __init__(self, img_size=224, feature_dim = 256, period = 25, max_seq_len = 751,  device = 'cpu'):
+    def __init__(self, img_size=224, feature_dim = 256, period = 25, max_seq_len = 751,  device = 'cpu', use_mbt=True):
         super(SpeakFormer, self).__init__()
 
+        self.use_mbt = use_mbt
         self.img_size = img_size
 
         self.feature_dim = feature_dim
@@ -35,6 +69,10 @@ class SpeakFormer(nn.Module):
         self.speaker_transformer_decoder2 = nn.TransformerDecoder(decoder_layer, num_layers=1)
         self.speaker_transformer_decoder3 = nn.TransformerDecoder(decoder_layer, num_layers=1)
 
+        if self.use_mbt:
+            self.speaker_transformer_decoder3 = MBT(feature_dim, 2, 4, 4, device)
+        else:
+            self.speaker_transformer_decoder3 = nn.TransformerDecoder(decoder_layer, num_layers=1)
 
         self.device = device
 
@@ -57,7 +95,10 @@ class SpeakFormer(nn.Module):
 
         speaker_vector = self.speaker_transformer_decoder1(video_features, video_features, tgt_mask=tgt_mask)
         speaker_vector = self.speaker_transformer_decoder2(speaker_vector, hidden_states, tgt_mask=tgt_mask, memory_mask=memory_mask)
-        speaker_motion = self.speaker_transformer_decoder3(speaker_vector, hidden_states, tgt_mask=tgt_mask, memory_mask=memory_mask)
+        if self.use_mbt:
+            speaker_motion, hidden_states = self.speaker_transformer_decoder3(speaker_vector, hidden_states)
+        else:
+            speaker_motion = self.speaker_transformer_decoder3(speaker_vector, hidden_states, tgt_mask=tgt_mask, memory_mask=memory_mask)
 
         return  speaker_motion, hidden_states, speaker_vector
 
